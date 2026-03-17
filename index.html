@@ -212,15 +212,34 @@
             { value: randomInt(17, 22), weight: 8 },
             { value: randomInt(23, 28), weight: 4 }
         ]);
+        const generateTargetExcluding = (excludedValue) => {
+            let nextTarget = generateTarget();
+            while (nextTarget === excludedValue) {
+                nextTarget = generateTarget();
+            }
+            return nextTarget;
+        };
+        const createConveyorTargets = () => {
+            const targets = [];
+            for (let i = 0; i < ROWS; i++) {
+                targets.push(generateTargetExcluding(i > 0 ? targets[i - 1] : null));
+            }
+            return targets;
+        };
         const createEmptyGrid = () => Array.from({ length: ROWS }, () => Array(COLS).fill(null));
 
         const App = () => {
+            const initialTargetState = useRef((() => {
+                const conveyor = createConveyorTargets();
+                return { conveyor, incoming: generateTargetExcluding(conveyor[0]) };
+            })());
+
             // Game State
             const [grid, setGrid] = useState(createEmptyGrid());
             const [activeTile, setActiveTile] = useState(null);
             const [queue, setQueue] = useState([generateTile(), generateTile()]);
-            const [conveyor, setConveyor] = useState(Array.from({ length: ROWS }, generateTarget));
-            const [incomingTarget, setIncomingTarget] = useState(generateTarget());
+            const [conveyor, setConveyor] = useState(initialTargetState.current.conveyor);
+            const [incomingTarget, setIncomingTarget] = useState(initialTargetState.current.incoming);
             const [conveyorAnim, setConveyorAnim] = useState(false);
             const [mode, setMode] = useState('direct');
             const [gameOver, setGameOver] = useState(false);
@@ -631,7 +650,7 @@
 
                     setConveyorAnim(false);
                     setConveyor(newConveyor);
-                    setIncomingTarget(generateTarget());
+                    setIncomingTarget(generateTargetExcluding(newConveyor[0]));
                     setAdvanceCount(nextAdvanceCount);
                     requestResolveVisibleMatches(grid, newConveyor);
                 }, 400); // Conveyor physical slide duration
@@ -667,8 +686,9 @@
                 resolvePendingRef.current = false;
                 resolvingRowsRef.current = false;
                 setGrid(createEmptyGrid());
-                setConveyor(Array.from({ length: ROWS }, generateTarget));
-                setIncomingTarget(generateTarget());
+                const nextConveyor = createConveyorTargets();
+                setConveyor(nextConveyor);
+                setIncomingTarget(generateTargetExcluding(nextConveyor[0]));
                 setActiveTile(null);
                 setQueue([generateTile(), generateTile()]);
                 setGameOver(false);
@@ -1076,7 +1096,7 @@
                                     onClick={restart}
                                     className="bg-white text-gray-900 px-8 py-3 rounded-full font-bold text-lg shadow-[0_4px_14px_0_rgba(255,255,255,0.2)] hover:shadow-[0_6px_20px_rgba(255,255,255,0.3)] hover:bg-opacity-90 transition-all"
                                 >
-                                    Restart Protocol
+                                    Restart
                                 </button>
                             </div>
                         </div>
