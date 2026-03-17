@@ -238,15 +238,23 @@
             const [advanceCount, setAdvanceCount] = useState(0);
 
             // Refs
-            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode });
+            const stateRef = useRef({ grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles });
             const tickTimerRef = useRef(null);
             const frameRef = useRef(null);
             const directDropCommitRef = useRef(null);
             const demoTimerRef = useRef(null);
+            const resolvePendingRef = useRef(false);
+            const resolvingRowsRef = useRef(false);
 
             useEffect(() => {
-                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode };
-            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode]);
+                stateRef.current = { grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles };
+            }, [grid, activeTile, conveyor, incomingTarget, mode, gameOver, queue, guideOpen, advanceCount, animatingDrop, demoMode, conveyorAnim, clearingRows, explodingParticles]);
+
+            useEffect(() => {
+                if (!conveyorAnim && resolvePendingRef.current) {
+                    requestResolveVisibleMatches();
+                }
+            }, [conveyorAnim]);
 
             // Unified Spawner
             const spawnTileForSliding = () => {
@@ -260,12 +268,90 @@
                 }
             };
 
-            const lockTile = (x, y, val) => {
-                setGrid(prev => {
-                    const newGrid = prev.map(row => [...row]);
-                    newGrid[y][x] = val;
-                    return newGrid;
+            const getRowSumFromGrid = (sourceGrid, rowIndex) => sourceGrid[rowIndex].reduce((sum, cell) => sum + (cell !== null ? cell : 0), 0);
+
+            // Intended rule: a row clears when it has at least one tile and its sum
+            // equals the row's currently visible conveyor target.
+            const findMatchingRows = (sourceGrid, sourceConveyor) => {
+                const matches = [];
+                for (let r = 0; r < ROWS; r++) {
+                    const hasTiles = sourceGrid[r].some(cell => cell !== null);
+                    if (!hasTiles) continue;
+                    const rowSum = getRowSumFromGrid(sourceGrid, r);
+                    if (rowSum === sourceConveyor[r]) matches.push(r);
+                }
+                return matches;
+            };
+
+            const requestResolveVisibleMatches = (gridOverride = null, conveyorOverride = null) => {
+                const workingGrid = gridOverride || stateRef.current.grid;
+                const workingConveyor = conveyorOverride || stateRef.current.conveyor;
+
+                if (resolvingRowsRef.current || stateRef.current.conveyorAnim || stateRef.current.gameOver) {
+                    resolvePendingRef.current = true;
+                    return;
+                }
+
+                const matchingRows = findMatchingRows(workingGrid, workingConveyor);
+                if (matchingRows.length === 0) {
+                    if (resolvePendingRef.current) {
+                        resolvePendingRef.current = false;
+                        setTimeout(() => requestResolveVisibleMatches(), 0);
+                    }
+                    return;
+                }
+
+                resolvingRowsRef.current = true;
+                resolvePendingRef.current = false;
+                setClearingRows(matchingRows);
+
+                const cascadeScore = getCascadeScore(matchingRows.length);
+                setScore(s => s + cascadeScore);
+
+                if (matchingRows.length > 1) {
+                    const comboLabel = matchingRows.length === 2 ? 'DOUBLE CLEAR' : matchingRows.length === 3 ? 'TRIPLE CLEAR' : `CASCADE x${matchingRows.length}`;
+                    setComboText(`${comboLabel} +${cascadeScore}`);
+                    setTimeout(() => setComboText(''), 1200);
+                }
+
+                const particlesToSpawn = [];
+                matchingRows.forEach(y => {
+                    workingGrid[y].forEach((cell, x) => {
+                        if (cell !== null) {
+                            particlesToSpawn.push({
+                                id: `p-${x}-${y}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                                x, y, val: cell,
+                                tx: `${randomInt(-200, 200)}px`,
+                                ty: `${randomInt(-150, -400)}px`,
+                                rot: `${randomInt(-180, 180)}deg`
+                            });
+                        }
+                    });
                 });
+
+                setTimeout(() => {
+                    setExplodingParticles(prev => [...prev, ...particlesToSpawn]);
+
+                    const collapsedGrid = workingGrid.filter((_, idx) => !matchingRows.includes(idx));
+                    for (let i = 0; i < matchingRows.length; i++) {
+                        collapsedGrid.unshift(Array(COLS).fill(null));
+                    }
+                    setGrid(collapsedGrid);
+                    setClearingRows([]);
+
+                    setTimeout(() => {
+                        setExplodingParticles([]);
+                        resolvingRowsRef.current = false;
+                        requestResolveVisibleMatches(collapsedGrid, stateRef.current.conveyor);
+                    }, 600);
+                }, 1000);
+            };
+
+            const lockTile = (x, y, val) => {
+                const newGrid = stateRef.current.grid.map(row => [...row]);
+                newGrid[y][x] = val;
+                setGrid(newGrid);
+                requestResolveVisibleMatches(newGrid, stateRef.current.conveyor);
                 
                 if (stateRef.current.mode === 'sliding') {
                     setActiveTile(null);
@@ -516,8 +602,6 @@
                 if (gameOver) setDemoMode(false);
             }, [gameOver]);
 
-            const getRowSumFromGrid = (sourceGrid, rowIndex) => sourceGrid[rowIndex].reduce((sum, cell) => sum + (cell !== null ? cell : 0), 0);
-
             const getRowDelta = (rowIndex, targetValue = conveyor[rowIndex]) => {
                 const sum = getRowSumFromGrid(grid, rowIndex);
                 const hasTiles = grid[rowIndex].some(cell => cell !== null);
@@ -535,7 +619,7 @@
                 return base + bonus;
             };
 
-            // Conveyor Logistics with Vibrate -> Explode -> Gravity sequence
+            // Conveyor movement: once the shift is visible, resolve matches against the now-visible targets.
             const evaluateRowsAndAdvance = () => {
                 const { grid, conveyor, incomingTarget, advanceCount } = stateRef.current;
                 
@@ -549,66 +633,7 @@
                     setConveyor(newConveyor);
                     setIncomingTarget(generateTarget());
                     setAdvanceCount(nextAdvanceCount);
-                    
-                    let cleared = [];
-                    for (let r = 0; r < ROWS; r++) {
-                        const rowSum = getRowSumFromGrid(grid, r);
-                        const hasTiles = grid[r].some(cell => cell !== null);
-                        
-                        if (hasTiles && rowSum === newConveyor[r]) {
-                            cleared.push(r);
-                        }
-                    }
-
-                    if (cleared.length > 0) {
-                        // 1. Begin 1-second vibration phase
-                        setClearingRows(cleared);
-                        const cascadeScore = getCascadeScore(cleared.length);
-                        setScore(s => s + cascadeScore);
-
-                        if (cleared.length > 1) {
-                            const comboLabel = cleared.length === 2 ? 'DOUBLE CLEAR' : cleared.length === 3 ? 'TRIPLE CLEAR' : `CASCADE x${cleared.length}`;
-                            setComboText(`${comboLabel} +${cascadeScore}`);
-                            setTimeout(() => setComboText(''), 1200);
-                        }
-
-                        // Generate future explosion particle data
-                        const particlesToSpawn = [];
-                        cleared.forEach(y => {
-                            grid[y].forEach((cell, x) => {
-                                if (cell !== null) {
-                                    particlesToSpawn.push({
-                                        id: `p-${x}-${y}-${Date.now()}`,
-                                        x, y, val: cell,
-                                        tx: `${randomInt(-200, 200)}px`,
-                                        ty: `${randomInt(-150, -400)}px`, 
-                                        rot: `${randomInt(-180, 180)}deg`
-                                    });
-                                }
-                            });
-                        });
-
-                        // 2. Trigger explosion and gravity
-                        setTimeout(() => {
-                            setExplodingParticles(prev => [...prev, ...particlesToSpawn]);
-                            
-                            setGrid(prevGrid => {
-                                let updatedGrid = prevGrid.filter((_, idx) => !cleared.includes(idx));
-                                for (let i = 0; i < cleared.length; i++) {
-                                    updatedGrid.unshift(Array(COLS).fill(null));
-                                }
-                                return updatedGrid;
-                            });
-                            
-                            setClearingRows([]);
-
-                            // 3. Clean up detached particles
-                            setTimeout(() => {
-                                setExplodingParticles([]);
-                            }, 600); // Matches CSS explodeAnim duration
-                            
-                        }, 1000); // Vibrate duration
-                    }
+                    requestResolveVisibleMatches(grid, newConveyor);
                 }, 400); // Conveyor physical slide duration
             };
 
@@ -639,6 +664,8 @@
             const resetGameState = ({ nextDemoMode = false, nextMode = stateRef.current.mode } = {}) => {
                 clearTimeout(directDropCommitRef.current);
                 clearTimeout(demoTimerRef.current);
+                resolvePendingRef.current = false;
+                resolvingRowsRef.current = false;
                 setGrid(createEmptyGrid());
                 setConveyor(Array.from({ length: ROWS }, generateTarget));
                 setIncomingTarget(generateTarget());
