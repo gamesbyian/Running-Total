@@ -228,6 +228,16 @@
             heightSpikePenalty: -26
         };
 
+        // Tiered heuristic composition:
+        // Tier 1 = tactical truths / hard constraints
+        // Tier 2 = strategic setups and forward value
+        // Tier 3 = soft shaping / aesthetics
+        const DEMO_TIER_MULTIPLIERS = {
+            tier1: 10,
+            tier2: 3,
+            tier3: 1
+        };
+
         // Utility
         const randomInt = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
         const lerp = (a, b, t) => a + (b - a) * t;
@@ -1016,29 +1026,118 @@
                 return score;
             };
 
+            const scoreImmediateClears = ({
+                sourceGrid,
+                nextGrid,
+                sourceConveyor,
+                landingRow,
+                beforeLandingSum,
+                afterLandingSum
+            }) => {
+                const landingTarget = sourceConveyor[landingRow];
+                const beforeGap = Math.abs(landingTarget - beforeLandingSum);
+                const afterGap = Math.abs(landingTarget - afterLandingSum);
+                const landingHadTiles = sourceGrid[landingRow].some(cell => cell !== null);
+
+                let score = 0;
+                score += scoreRowProximity(afterLandingSum, landingTarget, true, nextGrid, landingRow);
+                score += (beforeGap - afterGap) * DEMO_WEIGHTS.improveGap;
+                if (afterGap > beforeGap) score += DEMO_WEIGHTS.worsenGap;
+                if (landingHadTiles && afterGap <= beforeGap) score += DEMO_WEIGHTS.investedRowBonus;
+                return score;
+            };
+
+            const scoreConveyorForecast = ({
+                sourceGrid,
+                sourceConveyor,
+                sourceIncomingTarget,
+                rowIndex,
+                rowSum
+            }) => getConveyorForecastBonus({
+                sourceGrid,
+                sourceConveyor,
+                sourceIncomingTarget,
+                rowIndex,
+                rowSum
+            });
+
+            const scoreConstructiveOvershoot = ({
+                nextGrid,
+                sourceConveyor,
+                landingRow,
+                afterLandingSum
+            }) => {
+                const landingTarget = sourceConveyor[landingRow];
+                const landingGapSigned = getRowGapToTarget(afterLandingSum, landingTarget);
+                const landingEmptyAfter = getRowEmptyCount(nextGrid, landingRow);
+                if (landingGapSigned >= 0) return 0;
+
+                const overshoot = Math.abs(landingGapSigned);
+                const roomy = isRoomyRow(nextGrid, landingRow);
+                if (overshoot <= 4 && (roomy || landingEmptyAfter === 2) && afterLandingSum <= 24) {
+                    return DEMO_WEIGHTS.constructiveOvershootBonus;
+                }
+                return 0;
+            };
+
+            const scoreImminentLossAvoidance = ({ nextGrid, landingRow }) => {
+                let score = 0;
+                const heights = getColumnHeights(nextGrid);
+                heights.forEach(h => {
+                    if (h >= ROWS - 1) score += DEMO_WEIGHTS.landedTopDanger;
+                });
+                const topDanger = landingRow <= 2 ? (3 - landingRow) : 0;
+                if (topDanger > 0) score += topDanger * DEMO_WEIGHTS.landedTopDanger;
+                return score;
+            };
+
+            const scoreSkyline = (nextGrid) => {
+                let score = 0;
+                const heights = getColumnHeights(nextGrid);
+                const maxHeight = Math.max(...heights);
+                const minHeight = Math.min(...heights);
+
+                heights.forEach(h => {
+                    score += (h * DEMO_WEIGHTS.heightBase) + (h * h * DEMO_WEIGHTS.heightSquared);
+                });
+                score += maxHeight * DEMO_WEIGHTS.maxHeightDanger;
+                score += (maxHeight - minHeight) * DEMO_WEIGHTS.skylineSpreadPenalty;
+                for (let col = 1; col < COLS; col++) {
+                    score += Math.abs(heights[col] - heights[col - 1]) * DEMO_WEIGHTS.heightSpikePenalty;
+                }
+                return score;
+            };
+
+            const scoreCenterBias = (colIndex) => (
+                -Math.abs(colIndex - ((COLS - 1) / 2)) * 8
+            );
+
             const evaluateSimulatedMove = (sourceGrid, sourceConveyor, sourceIncomingTarget, simulated, rowsClearedCount, currentTile, nextTile) => {
                 if (!simulated) return Number.NEGATIVE_INFINITY;
                 const { nextGrid, landingRow, colIndex } = simulated;
                 const difficulty = getDifficulty(rowsClearedCount || 0);
                 const droppedValue = nextGrid[landingRow][colIndex];
 
-                let score = 0;
-                const landingTarget = sourceConveyor[landingRow];
                 const beforeLandingSum = getRowSumFromGrid(sourceGrid, landingRow);
                 const afterLandingSum = getRowSumFromGrid(nextGrid, landingRow);
-                const beforeGap = Math.abs(landingTarget - beforeLandingSum);
-                const afterGap = Math.abs(landingTarget - afterLandingSum);
-                const landingHadTiles = sourceGrid[landingRow].some(cell => cell !== null);
                 const landingEmptyAfter = getRowEmptyCount(nextGrid, landingRow);
-                const landingGapSigned = getRowGapToTarget(afterLandingSum, landingTarget);
+                const landingTarget = sourceConveyor[landingRow];
+                const afterGap = Math.abs(landingTarget - afterLandingSum);
 
-                score += scoreRowProximity(afterLandingSum, landingTarget, true, nextGrid, landingRow);
-                score += (beforeGap - afterGap) * DEMO_WEIGHTS.improveGap;
-                if (afterGap > beforeGap) score += DEMO_WEIGHTS.worsenGap;
-                if (landingHadTiles && afterGap <= beforeGap) score += DEMO_WEIGHTS.investedRowBonus;
-                score += scoreFlexibilityBands(afterLandingSum, true, difficulty, afterGap, landingEmptyAfter);
-                score += scoreMercyPreservation(beforeLandingSum, afterLandingSum, landingTarget, droppedValue);
-                score += scoreRowCapacityTactics({
+                let tier1Score = 0;
+                let tier2Score = 0;
+                let tier3Score = 0;
+
+                // Tier 1: major tactical truths that should dominate tie-breaking concerns.
+                tier1Score += scoreImmediateClears({
+                    sourceGrid,
+                    nextGrid,
+                    sourceConveyor,
+                    landingRow,
+                    beforeLandingSum,
+                    afterLandingSum
+                });
+                const rowCapacitySignal = scoreRowCapacityTactics({
                     sourceGrid,
                     sourceConveyor,
                     landingRow,
@@ -1046,22 +1145,26 @@
                     currentTile: currentTile !== undefined && currentTile !== null ? currentTile : droppedValue,
                     nextTile
                 });
-                score += getConveyorForecastBonus({
+                tier1Score += rowCapacitySignal;
+                tier1Score += scoreImminentLossAvoidance({ nextGrid, landingRow });
+
+                // Tier 2: strategy and setup value.
+                tier2Score += scoreFlexibilityBands(afterLandingSum, true, difficulty, afterGap, landingEmptyAfter);
+                tier2Score += scoreMercyPreservation(beforeLandingSum, afterLandingSum, landingTarget, droppedValue);
+                const landingForecastSignal = scoreConveyorForecast({
                     sourceGrid: nextGrid,
                     sourceConveyor,
                     sourceIncomingTarget,
                     rowIndex: landingRow,
                     rowSum: afterLandingSum
                 });
-
-                // Encourage healthy intentional build-up above current target when row is still shapeable.
-                if (landingGapSigned < 0) {
-                    const overshoot = Math.abs(landingGapSigned);
-                    const roomy = isRoomyRow(nextGrid, landingRow);
-                    if (overshoot <= 4 && (roomy || landingEmptyAfter === 2) && afterLandingSum <= 24) {
-                        score += DEMO_WEIGHTS.constructiveOvershootBonus;
-                    }
-                }
+                tier2Score += landingForecastSignal;
+                tier2Score += scoreConstructiveOvershoot({
+                    nextGrid,
+                    sourceConveyor,
+                    landingRow,
+                    afterLandingSum
+                });
 
                 for (let row = 0; row < ROWS; row++) {
                     if (row === landingRow) continue;
@@ -1069,41 +1172,36 @@
                     const rowSum = getRowSumFromGrid(nextGrid, row);
                     const rowGap = Math.abs(sourceConveyor[row] - rowSum);
                     const rowEmptyCount = getRowEmptyCount(nextGrid, row);
-                    score += scoreRowProximity(rowSum, sourceConveyor[row], rowHasTiles, nextGrid, row) * 0.2;
-                    score += scoreFlexibilityBands(rowSum, rowHasTiles, difficulty, rowGap, rowEmptyCount) * 0.75;
-                    score += getConveyorForecastBonus({
+                    tier1Score += scoreRowProximity(rowSum, sourceConveyor[row], rowHasTiles, nextGrid, row) * 0.2;
+                    tier2Score += scoreFlexibilityBands(rowSum, rowHasTiles, difficulty, rowGap, rowEmptyCount) * 0.75;
+                    tier2Score += scoreConveyorForecast({
                         sourceGrid: nextGrid,
                         sourceConveyor,
                         sourceIncomingTarget,
                         rowIndex: row,
                         rowSum
                     }) * 0.55;
-                    if (rowHasTiles) score += DEMO_WEIGHTS.activeRowBonus;
+                    if (rowHasTiles) tier2Score += DEMO_WEIGHTS.activeRowBonus;
                 }
 
-                score += scoreBoardHealth(nextGrid, sourceConveyor, difficulty);
+                tier2Score += scoreBoardHealth(nextGrid, sourceConveyor, difficulty);
 
-                const heights = getColumnHeights(nextGrid);
-                const maxHeight = Math.max(...heights);
-                const minHeight = Math.min(...heights);
-                heights.forEach(h => {
-                    score += (h * DEMO_WEIGHTS.heightBase) + (h * h * DEMO_WEIGHTS.heightSquared);
-                    if (h >= ROWS - 1) score += DEMO_WEIGHTS.landedTopDanger;
-                });
+                // Tier 3: soft shape guidance only.
+                tier3Score += scoreSkyline(nextGrid);
+                tier3Score += scoreCenterBias(colIndex);
 
-                score += maxHeight * DEMO_WEIGHTS.maxHeightDanger;
-                score += (maxHeight - minHeight) * DEMO_WEIGHTS.skylineSpreadPenalty;
-                for (let col = 1; col < COLS; col++) {
-                    score += Math.abs(heights[col] - heights[col - 1]) * DEMO_WEIGHTS.heightSpikePenalty;
-                }
+                // Soft priority boosts: strengthen strong strategic truths without brittle if/else rules.
+                const hasImmediateClear = afterLandingSum === landingTarget;
+                if (hasImmediateClear) tier1Score += DEMO_WEIGHTS.exactMatch * 0.45;
 
-                const topDanger = landingRow <= 2 ? (3 - landingRow) : 0;
-                if (topDanger > 0) score += topDanger * DEMO_WEIGHTS.landedTopDanger;
+                if (rowCapacitySignal > 0) tier1Score += rowCapacitySignal * 0.2;
+                if (landingForecastSignal > 0) tier2Score += landingForecastSignal * 0.25;
 
-                // Small center bias keeps the bot from tunneling one side.
-                score -= Math.abs(colIndex - ((COLS - 1) / 2)) * 8;
-
-                return score;
+                return (
+                    tier1Score * DEMO_TIER_MULTIPLIERS.tier1
+                    + tier2Score * DEMO_TIER_MULTIPLIERS.tier2
+                    + tier3Score * DEMO_TIER_MULTIPLIERS.tier3
+                );
             };
 
             const chooseDemoColumn = (sourceGrid, sourceConveyor, sourceIncomingTarget, currentTile, nextTile, rowsClearedCount) => {
