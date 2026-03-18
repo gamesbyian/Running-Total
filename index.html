@@ -175,8 +175,13 @@
             near3: 36,
             improveGap: 26,
             worsenGap: -68,
-            overshootUnit: -140,
-            overshootQuad: -22,
+            overshootUnit: -52,
+            overshootQuad: -6,
+            overshootLargeUnit: -66,
+            overshootExtremeUnit: -110,
+            crampedOvershootPenalty: -90,
+            roomyOvershootToleranceBonus: 34,
+            constructiveOvershootBonus: 56,
             investedRowBonus: 52,
             junkRowPenalty: -32,
             activeRowBonus: 4,
@@ -184,17 +189,21 @@
             // Flexibility, target-band and overcommitment controls.
             mercyRowBonus: 28,
             easyShapeRowBonus: 22,
-            hardRowPenalty: -18,
-            veryHighUnshapedPenalty: -28,
+            hardRowPenalty: -8,
+            veryHighUnshapedPenalty: -24,
             preserveMercyPenaltyPerTile: -18,
             preserveMercyLargeTilePenalty: -16,
-            overcommitPenaltyUnit: -24,
+            overcommitPenaltyUnit: -16,
             flexibilityBandBonus: 26,
             flexibleMixBonus: 34,
-            allHighRowsPenalty: -210,
+            allHighRowsPenalty: -110,
             emergencyRowsPenalty: -68,
             rowSumSpreadPenalty: -4,
-            highClusterPenalty: -62,
+            highClusterPenalty: -24,
+            shapeableMidHighBonus: 28,
+            futureBand6to12Bonus: 26,
+            futureBand13to18Bonus: 40,
+            futureBand19to24Bonus: 24,
 
             // Tactical row-capacity awareness (protect fragile last-slot opportunities).
             lastSlotWasteBasePenalty: -640,
@@ -640,19 +649,65 @@
             const getRowBand = (sum) => {
                 if (sum <= 5) return 'mercy';
                 if (sum <= 12) return 'lowMid';
-                if (sum <= 20) return 'midHigh';
+                if (sum <= 18) return 'midHigh';
+                if (sum <= 24) return 'highCommit';
                 return 'veryHigh';
+            };
+
+            const getRowRoominess = (sourceGrid, rowIndex) => {
+                const emptyCount = getRowEmptyCount(sourceGrid, rowIndex);
+                if (emptyCount >= 3) return 'roomy';
+                if (emptyCount === 2) return 'semi';
+                return 'cramped';
+            };
+
+            const isRoomyRow = (sourceGrid, rowIndex) => getRowRoominess(sourceGrid, rowIndex) === 'roomy';
+
+            // Positive value for sums that are likely to become useful targets in coming shifts.
+            const getFutureBandValue = (rowSum, difficulty, emptyCount) => {
+                const spaceFactor = lerp(0.8, 1.12, Math.min(emptyCount, 4) / 4);
+                if (rowSum >= 6 && rowSum <= 12) return DEMO_WEIGHTS.futureBand6to12Bonus * spaceFactor;
+                if (rowSum >= 13 && rowSum <= 18) return lerp(1.1, 0.92, difficulty) * DEMO_WEIGHTS.futureBand13to18Bonus * spaceFactor;
+                if (rowSum >= 19 && rowSum <= 24) return lerp(0.82, 1.0, difficulty) * DEMO_WEIGHTS.futureBand19to24Bonus * spaceFactor;
+                return 0;
+            };
+
+            // Contextual overshoot: roomy moderate overshoot is tolerable, cramped overshoot is dangerous.
+            const getContextualOvershootScore = ({ rowGap, emptyCount, rowSum }) => {
+                if (rowGap >= 0) return 0;
+                const overshoot = Math.abs(rowGap);
+                const roomyFactor = emptyCount >= 3 ? 0.62 : emptyCount === 2 ? 0.9 : 1.4;
+                const base = (
+                    overshoot * DEMO_WEIGHTS.overshootUnit
+                    + (overshoot * overshoot * DEMO_WEIGHTS.overshootQuad)
+                ) * roomyFactor;
+
+                let score = base;
+                if (overshoot >= 9) score += (overshoot - 8) * DEMO_WEIGHTS.overshootExtremeUnit;
+                else if (overshoot >= 6) score += (overshoot - 5) * DEMO_WEIGHTS.overshootLargeUnit;
+
+                const roomyRow = emptyCount >= 3;
+                const semiRoomyRow = emptyCount === 2;
+                const inUsefulBand = rowSum >= 13 && rowSum <= 24;
+                if (overshoot <= 4 && roomyRow) score += DEMO_WEIGHTS.roomyOvershootToleranceBonus;
+                if (overshoot <= 4 && inUsefulBand && (roomyRow || semiRoomyRow)) {
+                    score += DEMO_WEIGHTS.constructiveOvershootBonus;
+                }
+
+                if (emptyCount <= 1 && overshoot >= 3) score += (overshoot - 2) * DEMO_WEIGHTS.crampedOvershootPenalty;
+                return score;
             };
 
             const getBandPreference = (difficulty) => ({
                 mercy: lerp(1.2, 0.7, difficulty),
                 lowMid: lerp(1.15, 0.85, difficulty),
-                midHigh: lerp(0.7, 1.1, difficulty),
-                veryHigh: lerp(0.35, 0.95, difficulty)
+                midHigh: lerp(0.96, 1.18, difficulty),
+                highCommit: lerp(0.72, 1.0, difficulty),
+                veryHigh: lerp(0.25, 0.82, difficulty)
             });
 
             // Row-level proximity score: still rewards clears, but lowers greedy near-match dominance.
-            const scoreRowProximity = (sum, target, hasTiles) => {
+            const scoreRowProximity = (sum, target, hasTiles, sourceGrid, rowIndex) => {
                 if (!hasTiles) return 0;
                 const gap = target - sum;
                 const absGap = Math.abs(gap);
@@ -663,8 +718,8 @@
 
                 let score = 0;
                 if (gap < 0) {
-                    const overshoot = Math.abs(gap);
-                    score += (overshoot * DEMO_WEIGHTS.overshootUnit) + (overshoot * overshoot * DEMO_WEIGHTS.overshootQuad);
+                    const emptyCount = rowIndex !== undefined ? getRowEmptyCount(sourceGrid, rowIndex) : 2;
+                    score += getContextualOvershootScore({ rowGap: gap, emptyCount, rowSum: sum });
                 } else if (absGap >= 7) {
                     score += DEMO_WEIGHTS.junkRowPenalty * Math.min(absGap - 6, 4);
                 }
@@ -672,7 +727,7 @@
             };
 
             // Reward rows that remain in reachable bands (mercy + easy-shaping).
-            const scoreFlexibilityBands = (rowSum, hasTiles, difficulty, rowGap) => {
+            const scoreFlexibilityBands = (rowSum, hasTiles, difficulty, rowGap, emptyCount) => {
                 if (!hasTiles) return 0;
 
                 const band = getRowBand(rowSum);
@@ -680,10 +735,12 @@
                 if (band === 'mercy') score += DEMO_WEIGHTS.mercyRowBonus;
                 if (band === 'lowMid') score += DEMO_WEIGHTS.easyShapeRowBonus;
                 if (band === 'midHigh') score += DEMO_WEIGHTS.hardRowPenalty;
+                if (band === 'highCommit' && emptyCount >= 2) score += DEMO_WEIGHTS.shapeableMidHighBonus;
                 if (band === 'veryHigh') score += DEMO_WEIGHTS.veryHighUnshapedPenalty;
 
                 const pref = getBandPreference(difficulty);
                 score += (pref[band] || 0) * DEMO_WEIGHTS.flexibilityBandBonus;
+                score += getFutureBandValue(rowSum, difficulty, emptyCount);
 
                 // Very high rows are less concerning only when near completion.
                 if (rowSum > 20 && rowGap > 3) {
@@ -709,23 +766,27 @@
                 let mercyCount = 0;
                 let lowMidCount = 0;
                 let hardCount = 0;
+                let shapeableHardCount = 0;
                 let emergencyCount = 0;
                 let highClusterCount = 0;
-                let prevHigh = false;
+                let prevCrampedHigh = false;
 
                 for (let row = 0; row < ROWS; row++) {
                     if (!rowHasTiles(sourceGrid, row)) continue;
                     const sum = getRowSumFromGrid(sourceGrid, row);
                     const gap = Math.abs(sourceConveyor[row] - sum);
+                    const emptyCount = getRowEmptyCount(sourceGrid, row);
                     rowSums.push(sum);
                     if (sum <= 5) mercyCount++;
                     else if (sum <= 12) lowMidCount++;
                     if (sum >= 13) hardCount++;
-                    if (sum >= 20 && gap > 4) emergencyCount++;
+                    if (sum >= 13 && emptyCount >= 2) shapeableHardCount++;
+                    if (sum >= 24 && gap > 5 && emptyCount <= 1) emergencyCount++;
 
                     const isHigh = sum >= 13;
-                    if (isHigh && prevHigh) highClusterCount++;
-                    prevHigh = isHigh;
+                    const rowIsCrampedHigh = isHigh && emptyCount <= 1;
+                    if (rowIsCrampedHigh && prevCrampedHigh) highClusterCount++;
+                    prevCrampedHigh = rowIsCrampedHigh;
                 }
 
                 if (!rowSums.length) return 0;
@@ -734,12 +795,13 @@
                 const healthyMix = Math.min(mercyCount, 2) + Math.min(lowMidCount, 3);
                 score += healthyMix * DEMO_WEIGHTS.flexibleMixBonus;
 
-                const safeHardBudget = Math.round(lerp(2, 5, difficulty));
+                const safeHardBudget = Math.round(lerp(3, 6, difficulty));
                 if (hardCount > safeHardBudget) {
                     score += (hardCount - safeHardBudget) * DEMO_WEIGHTS.overcommitPenaltyUnit;
                 }
 
-                if (hardCount >= rowSums.length - 1) score += DEMO_WEIGHTS.allHighRowsPenalty;
+                if (hardCount >= rowSums.length - 1 && shapeableHardCount <= 1) score += DEMO_WEIGHTS.allHighRowsPenalty;
+                score += shapeableHardCount * DEMO_WEIGHTS.shapeableMidHighBonus * 0.4;
                 score += emergencyCount * DEMO_WEIGHTS.emergencyRowsPenalty;
                 score += highClusterCount * DEMO_WEIGHTS.highClusterPenalty;
 
@@ -839,12 +901,14 @@
                 const beforeGap = Math.abs(landingTarget - beforeLandingSum);
                 const afterGap = Math.abs(landingTarget - afterLandingSum);
                 const landingHadTiles = sourceGrid[landingRow].some(cell => cell !== null);
+                const landingEmptyAfter = getRowEmptyCount(nextGrid, landingRow);
+                const landingGapSigned = getRowGapToTarget(afterLandingSum, landingTarget);
 
-                score += scoreRowProximity(afterLandingSum, landingTarget, true);
+                score += scoreRowProximity(afterLandingSum, landingTarget, true, nextGrid, landingRow);
                 score += (beforeGap - afterGap) * DEMO_WEIGHTS.improveGap;
                 if (afterGap > beforeGap) score += DEMO_WEIGHTS.worsenGap;
                 if (landingHadTiles && afterGap <= beforeGap) score += DEMO_WEIGHTS.investedRowBonus;
-                score += scoreFlexibilityBands(afterLandingSum, true, difficulty, afterGap);
+                score += scoreFlexibilityBands(afterLandingSum, true, difficulty, afterGap, landingEmptyAfter);
                 score += scoreMercyPreservation(beforeLandingSum, afterLandingSum, landingTarget, droppedValue);
                 score += scoreRowCapacityTactics({
                     sourceGrid,
@@ -855,13 +919,23 @@
                     nextTile
                 });
 
+                // Encourage healthy intentional build-up above current target when row is still shapeable.
+                if (landingGapSigned < 0) {
+                    const overshoot = Math.abs(landingGapSigned);
+                    const roomy = isRoomyRow(nextGrid, landingRow);
+                    if (overshoot <= 4 && (roomy || landingEmptyAfter === 2) && afterLandingSum <= 24) {
+                        score += DEMO_WEIGHTS.constructiveOvershootBonus;
+                    }
+                }
+
                 for (let row = 0; row < ROWS; row++) {
                     if (row === landingRow) continue;
                     const rowHasTiles = nextGrid[row].some(cell => cell !== null);
                     const rowSum = getRowSumFromGrid(nextGrid, row);
                     const rowGap = Math.abs(sourceConveyor[row] - rowSum);
-                    score += scoreRowProximity(rowSum, sourceConveyor[row], rowHasTiles) * 0.2;
-                    score += scoreFlexibilityBands(rowSum, rowHasTiles, difficulty, rowGap) * 0.75;
+                    const rowEmptyCount = getRowEmptyCount(nextGrid, row);
+                    score += scoreRowProximity(rowSum, sourceConveyor[row], rowHasTiles, nextGrid, row) * 0.2;
+                    score += scoreFlexibilityBands(rowSum, rowHasTiles, difficulty, rowGap, rowEmptyCount) * 0.75;
                     if (rowHasTiles) score += DEMO_WEIGHTS.activeRowBonus;
                 }
 
