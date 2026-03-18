@@ -225,7 +225,19 @@
             heightSquared: -15,
             maxHeightDanger: -90,
             skylineSpreadPenalty: -20,
-            heightSpikePenalty: -26
+            heightSpikePenalty: -26,
+
+            // Functional foundation awareness.
+            foundationFillUnit: 44,
+            foundationBreadthUnit: 34,
+            foundationShelfBonus: 26,
+            viableFoundationNearCompleteBonus: 74,
+            deadRowClingPenalty: -95,
+            deadRowInvestmentPenalty: -150,
+            unsupportedUpperMassPenalty: -82,
+            topHeavyWeakFoundationPenalty: -72,
+            weakFoundationTowerPenalty: -168,
+            strongFoundationTowerRelief: 46
         };
 
         // Tiered heuristic composition:
@@ -422,7 +434,10 @@
 
             const rowHasTiles = (sourceGrid, rowIndex) => sourceGrid[rowIndex].some(cell => cell !== null);
             const getRowFilledCount = (sourceGrid, rowIndex) => sourceGrid[rowIndex].reduce((count, cell) => count + (cell !== null ? 1 : 0), 0);
+            const getRowFillCount = (sourceGrid, rowIndex) => getRowFilledCount(sourceGrid, rowIndex);
             const getRowEmptyCount = (sourceGrid, rowIndex) => COLS - getRowFilledCount(sourceGrid, rowIndex);
+            const getRowPositiveValues = (sourceGrid, rowIndex) => sourceGrid[rowIndex].filter(cell => cell !== null && cell > 0);
+            const getRowSumForGrid = (sourceGrid, rowIndex) => getRowSumFromGrid(sourceGrid, rowIndex);
             const getRowGapToTarget = (rowSum, target) => target - rowSum;
             const isLastSlotMove = (sourceGrid, rowIndex) => getRowEmptyCount(sourceGrid, rowIndex) === 1;
             const nextTileExactlyFitsRow = (rowSum, target, nextTile) => (
@@ -612,6 +627,82 @@
                 }
 
                 return bonus;
+            };
+
+            const rowCanReasonablyClearSoon = (sourceGrid, rowSum, rowIndex, sourceConveyor, sourceIncomingTarget, difficulty) => {
+                if (!rowHasTiles(sourceGrid, rowIndex)) return false;
+
+                const emptyCount = getRowEmptyCount(sourceGrid, rowIndex);
+                const fillCount = getRowFillCount(sourceGrid, rowIndex);
+                const targetNow = sourceConveyor[rowIndex];
+                const gapNow = Math.abs(targetNow - rowSum);
+
+                if (rowSum === targetNow) return true;
+                if (gapNow <= 2 && emptyCount >= 1) return true;
+                if (gapNow <= 4 && emptyCount >= 2 && rowSum <= 24) return true;
+
+                const upcoming = getUpcomingTargetsForRow(sourceGrid, sourceConveyor, sourceIncomingTarget, rowIndex, 3);
+                for (const { advancesAway, target } of upcoming) {
+                    if (target === null || target === undefined || target !== rowSum) continue;
+                    const wait = rowCanReasonablyWaitForTarget(sourceGrid, rowIndex, rowSum, target, advancesAway);
+                    if (wait.canWait && wait.stability >= 0.4) return true;
+                }
+
+                // Conservative fallback: a still-roomy row might be reshaped into target soon.
+                return fillCount <= 4 && emptyCount >= 2 && gapNow <= Math.round(lerp(4, 6, difficulty));
+            };
+
+            const isDeadRow = (sourceGrid, rowSum, rowIndex, sourceConveyor, sourceIncomingTarget, difficulty) => {
+                if (!rowHasTiles(sourceGrid, rowIndex)) return false;
+
+                const fillCount = getRowFillCount(sourceGrid, rowIndex);
+                const emptyCount = getRowEmptyCount(sourceGrid, rowIndex);
+                const targetNow = sourceConveyor[rowIndex];
+                const absGap = Math.abs(targetNow - rowSum);
+                const positiveValues = getRowPositiveValues(sourceGrid, rowIndex);
+                const concentrated = positiveValues.length > 0 && positiveValues.reduce((a, b) => a + b, 0) >= 20;
+                const barelyShapeable = emptyCount <= 1 || (emptyCount === 2 && rowSum >= 22);
+                const cramped = fillCount >= COLS - 1;
+                const likelyClearSoon = rowCanReasonablyClearSoon(
+                    sourceGrid,
+                    rowSum,
+                    rowIndex,
+                    sourceConveyor,
+                    sourceIncomingTarget,
+                    difficulty
+                );
+
+                // Dead rows are cramped, not currently matching, and unlikely to clear shortly.
+                return (
+                    rowSum !== targetNow
+                    && !likelyClearSoon
+                    && cramped
+                    && barelyShapeable
+                    && (absGap >= 4 || concentrated)
+                );
+            };
+
+            const getActiveFoundationStartRow = (sourceGrid, sourceConveyor, sourceIncomingTarget, difficulty) => {
+                // Promote upwards when lower rows become effectively dead.
+                for (let row = ROWS - 1; row >= 0; row--) {
+                    if (!rowHasTiles(sourceGrid, row)) continue;
+                    const rowSum = getRowSumForGrid(sourceGrid, row);
+                    const dead = isDeadRow(sourceGrid, rowSum, row, sourceConveyor, sourceIncomingTarget, difficulty);
+                    if (!dead) return row;
+                }
+
+                // If all occupied lower rows are dead (or board is very empty), anchor near physical bottom.
+                return ROWS - 1;
+            };
+
+            const getFoundationRows = (sourceGrid, activeFoundationStartRow, count = 4) => {
+                const rows = [];
+                for (let offset = 0; offset < count; offset++) {
+                    const row = activeFoundationStartRow - offset;
+                    if (row < 0 || row >= ROWS) break;
+                    rows.push(row);
+                }
+                return rows;
             };
 
             // Intended rule: a row clears when it has at least one tile and its sum
@@ -950,6 +1041,100 @@
                 return score;
             };
 
+            const scoreFoundationDevelopment = ({
+                sourceGrid,
+                sourceConveyor,
+                sourceIncomingTarget,
+                difficulty
+            }) => {
+                const activeFoundationStartRow = getActiveFoundationStartRow(sourceGrid, sourceConveyor, sourceIncomingTarget, difficulty);
+                const foundationRows = getFoundationRows(sourceGrid, activeFoundationStartRow, 4);
+                if (!foundationRows.length) return { score: 0, activeFoundationStartRow, foundationRows, quality: 0 };
+
+                let score = 0;
+                let totalFillRatio = 0;
+                let rowContribution = 0;
+                let deadInvestmentRisk = 0;
+
+                foundationRows.forEach((row, idx) => {
+                    const rowSum = getRowSumForGrid(sourceGrid, row);
+                    const fillCount = getRowFillCount(sourceGrid, row);
+                    const fillRatio = fillCount / COLS;
+                    const rowWeight = lerp(1.12, 0.78, idx / Math.max(1, foundationRows.length - 1));
+                    const isViable = !isDeadRow(sourceGrid, rowSum, row, sourceConveyor, sourceIncomingTarget, difficulty);
+                    const rowGap = Math.abs(sourceConveyor[row] - rowSum);
+
+                    if (isViable) {
+                        score += fillCount * DEMO_WEIGHTS.foundationFillUnit * rowWeight;
+                        if (fillCount >= 4) score += DEMO_WEIGHTS.foundationBreadthUnit * rowWeight;
+                        if (fillCount >= 5) score += DEMO_WEIGHTS.foundationShelfBonus * rowWeight;
+                        if (fillCount >= 5 && rowGap <= 2) score += DEMO_WEIGHTS.viableFoundationNearCompleteBonus * rowWeight;
+                    } else {
+                        deadInvestmentRisk += fillCount * (idx === 0 ? 1 : 0.55);
+                    }
+
+                    totalFillRatio += fillRatio;
+                    rowContribution += rowWeight;
+                });
+
+                const avgFillRatio = totalFillRatio / foundationRows.length;
+                const quality = Math.min(1, (avgFillRatio * 0.72) + (rowContribution / (foundationRows.length * 1.12) * 0.28));
+                score += deadInvestmentRisk * DEMO_WEIGHTS.deadRowInvestmentPenalty;
+
+                return { score, activeFoundationStartRow, foundationRows, quality };
+            };
+
+            const scoreFoundationSupport = ({
+                sourceGrid,
+                activeFoundationStartRow,
+                foundationRows,
+                foundationQuality
+            }) => {
+                if (!foundationRows.length) return 0;
+
+                const supportThresholdRow = Math.max(0, activeFoundationStartRow - foundationRows.length);
+                let upperMass = 0;
+                for (let row = 0; row < supportThresholdRow; row++) {
+                    upperMass += getRowFillCount(sourceGrid, row);
+                }
+
+                const baseSupportCells = foundationRows.reduce((sum, row) => sum + getRowFillCount(sourceGrid, row), 0);
+                const supportRatio = baseSupportCells > 0 ? upperMass / baseSupportCells : upperMass;
+                let score = 0;
+                if (upperMass > 0 && supportRatio > 0.45) {
+                    score += (supportRatio - 0.45) * DEMO_WEIGHTS.unsupportedUpperMassPenalty * 3.2;
+                }
+                if (upperMass > 0 && foundationQuality < 0.45) {
+                    score += (0.45 - foundationQuality) * DEMO_WEIGHTS.topHeavyWeakFoundationPenalty * (1 + (upperMass / 10));
+                }
+                return score;
+            };
+
+            const scoreUnsupportedUpperMass = ({
+                sourceGrid,
+                activeFoundationStartRow,
+                foundationRows,
+                foundationQuality
+            }) => scoreFoundationSupport({
+                sourceGrid,
+                activeFoundationStartRow,
+                foundationRows,
+                foundationQuality
+            });
+
+            const scoreTowerOnWeakFoundation = ({ sourceGrid, foundationQuality }) => {
+                const heights = getColumnHeights(sourceGrid);
+                const maxHeight = Math.max(...heights);
+                const avgHeight = heights.reduce((sum, h) => sum + h, 0) / heights.length;
+                const spikeStrength = Math.max(0, maxHeight - avgHeight - 1.15);
+                if (spikeStrength <= 0) return 0;
+
+                if (foundationQuality < 0.55) {
+                    return spikeStrength * DEMO_WEIGHTS.weakFoundationTowerPenalty * (0.6 + (0.55 - foundationQuality));
+                }
+                return spikeStrength * DEMO_WEIGHTS.strongFoundationTowerRelief * Math.min(0.8, foundationQuality);
+            };
+
             const getReservedRowData = (sourceGrid, sourceConveyor, nextTile) => {
                 const reservedRows = [];
                 const nearTwoSlotRows = [];
@@ -1123,6 +1308,18 @@
                 const landingEmptyAfter = getRowEmptyCount(nextGrid, landingRow);
                 const landingTarget = sourceConveyor[landingRow];
                 const afterGap = Math.abs(landingTarget - afterLandingSum);
+                const foundationBefore = scoreFoundationDevelopment({
+                    sourceGrid,
+                    sourceConveyor,
+                    sourceIncomingTarget,
+                    difficulty
+                });
+                const foundationAfter = scoreFoundationDevelopment({
+                    sourceGrid: nextGrid,
+                    sourceConveyor,
+                    sourceIncomingTarget,
+                    difficulty
+                });
 
                 let tier1Score = 0;
                 let tier2Score = 0;
@@ -1185,6 +1382,36 @@
                 }
 
                 tier2Score += scoreBoardHealth(nextGrid, sourceConveyor, difficulty);
+                tier2Score += foundationAfter.score;
+
+                // Structural support: punish top-heavy states and weak-floor towers.
+                tier1Score += scoreUnsupportedUpperMass({
+                    sourceGrid: nextGrid,
+                    activeFoundationStartRow: foundationAfter.activeFoundationStartRow,
+                    foundationRows: foundationAfter.foundationRows,
+                    foundationQuality: foundationAfter.quality
+                });
+                tier1Score += scoreTowerOnWeakFoundation({
+                    sourceGrid: nextGrid,
+                    foundationQuality: foundationAfter.quality
+                });
+
+                // If bottom rows are dead and foundation has shifted upward, discourage clinging to dead floor.
+                if (foundationAfter.activeFoundationStartRow < ROWS - 1 && landingRow > foundationAfter.activeFoundationStartRow) {
+                    const landingDead = isDeadRow(
+                        nextGrid,
+                        afterLandingSum,
+                        landingRow,
+                        sourceConveyor,
+                        sourceIncomingTarget,
+                        difficulty
+                    );
+                    if (landingDead) tier1Score += DEMO_WEIGHTS.deadRowClingPenalty;
+                }
+
+                // Encourage improvement in functional foundation quality over the prior board.
+                const foundationQualityDelta = foundationAfter.quality - foundationBefore.quality;
+                tier2Score += foundationQualityDelta * (DEMO_WEIGHTS.foundationBreadthUnit * 9);
 
                 // Tier 3: soft shape guidance only.
                 tier3Score += scoreSkyline(nextGrid);
