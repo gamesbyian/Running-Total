@@ -203,8 +203,16 @@
 <body>
     <div id="root"></div>
 
+    <script src="./gameConstants.js"></script>
+    <script src="./gameGeneration.js"></script>
+    <script src="./gameScoring.js"></script>
+    <script src="./gameModel.js"></script>
+    <script src="./gameDemo.js"></script>
+
     <script type="text/babel">
         const { useState, useEffect, useRef, useCallback, useMemo } = React;
+        const GameRules = GameModel;
+        const GameDemoApi = GameDemo;
 
         // Constants
         const ROWS = 12;
@@ -668,7 +676,7 @@
                 return { conveyor, incoming: generateTargetExcluding(conveyor[0]) };
             })());
 
-            // Game State
+            // Pure gameplay state mirrors the headless model (serializable and deterministic).
             const [grid, setGrid] = useState(createEmptyGrid());
             const [activeTile, setActiveTile] = useState(null);
             const [queue, setQueue] = useState([generateTile(), generateTile()]);
@@ -686,7 +694,7 @@
             const [animatingDrop, setAnimatingDrop] = useState(null);
             const [demoMode, setDemoMode] = useState(false);
 
-            // Timing & FX state
+            // UI-only orchestration state (animation phases, modal/guide, and visual feedback).
             const [tickCycle, setTickCycle] = useState(0);
             const [clearingRows, setClearingRows] = useState([]);
             const [explodingParticles, setExplodingParticles] = useState([]);
@@ -1325,18 +1333,11 @@
             }, [activeTile, gameOver, mode]);
 
             const getLandingRowForColumn = (sourceGrid, colIndex) => {
-                for (let r = ROWS - 1; r >= 0; r--) {
-                    if (sourceGrid[r][colIndex] === null) return r;
-                }
-                return -1;
+                return GameRules.getLandingRowForColumn(sourceGrid, colIndex);
             };
 
             const getLegalDirectDropColumns = (sourceGrid) => {
-                const legal = [];
-                for (let col = 0; col < COLS; col++) {
-                    if (getLandingRowForColumn(sourceGrid, col) !== -1) legal.push(col);
-                }
-                return legal;
+                return GameRules.getLegalDirectDropColumns({ grid: sourceGrid });
             };
 
             const getColumnHeights = (sourceGrid) => {
@@ -1355,12 +1356,21 @@
             };
 
             const simulateDirectDropResult = (sourceGrid, colIndex, valToDrop) => {
-                const landingRow = getLandingRowForColumn(sourceGrid, colIndex);
-                if (landingRow === -1) return null;
-
-                const nextGrid = sourceGrid.map(row => [...row]);
-                nextGrid[landingRow][colIndex] = valToDrop;
-                return { nextGrid, landingRow, colIndex };
+                const simulated = GameRules.simulateDirectDrop({
+                    grid: sourceGrid,
+                    queue: [valToDrop, null],
+                    conveyor: stateRef.current.conveyor,
+                    incomingTarget: stateRef.current.incomingTarget,
+                    mode: stateRef.current.mode,
+                    gameOver: stateRef.current.gameOver,
+                    score: stateRef.current.score,
+                    rowsClearedTotal: stateRef.current.rowsClearedTotal,
+                    advanceCount: stateRef.current.advanceCount,
+                    swapsAvailable: stateRef.current.swapsAvailable,
+                    swapRegenElapsedMs: stateRef.current.swapRegenElapsedMs
+                }, colIndex, valToDrop);
+                if (!simulated) return null;
+                return { nextGrid: simulated.nextState.grid, landingRow: simulated.landingRow, colIndex };
             };
 
             const getRowBand = (sum) => {
@@ -1935,33 +1945,30 @@
             };
 
             const chooseDemoColumn = (sourceGrid, sourceConveyor, sourceIncomingTarget, currentTile, nextTile, rowsClearedCount) => {
-                const legalCols = getLegalDirectDropColumns(sourceGrid);
-                if (!legalCols.length) return { col: -1, score: Number.NEGATIVE_INFINITY };
-
-                let bestCol = legalCols[0];
-                let bestScore = Number.NEGATIVE_INFINITY;
-                legalCols.forEach(col => {
-                    const currentSim = simulateDirectDropResult(sourceGrid, col, currentTile);
-                    const currentScore = evaluateSimulatedMove(sourceGrid, sourceConveyor, sourceIncomingTarget, currentSim, rowsClearedCount, currentTile, nextTile);
-
-                    let combinedScore = currentScore * DEMO_IMMEDIATE_FACTOR;
-                    if (nextTile !== undefined && nextTile !== null && currentSim) {
-                        const nextLegalCols = getLegalDirectDropColumns(currentSim.nextGrid);
-                        let nextBest = Number.NEGATIVE_INFINITY;
-                        nextLegalCols.forEach(nextCol => {
-                            const nextSim = simulateDirectDropResult(currentSim.nextGrid, nextCol, nextTile);
-                            const nextScore = evaluateSimulatedMove(currentSim.nextGrid, sourceConveyor, sourceIncomingTarget, nextSim, rowsClearedCount, nextTile, null);
-                            if (nextScore > nextBest) nextBest = nextScore;
-                        });
-                        if (nextBest !== Number.NEGATIVE_INFINITY) combinedScore += nextBest * DEMO_LOOKAHEAD_FACTOR;
-                    }
-
-                    if (combinedScore > bestScore) {
-                        bestScore = combinedScore;
-                        bestCol = col;
-                    }
-                });
-                return { col: bestCol, score: bestScore };
+                const gameState = {
+                    grid: sourceGrid.map((row) => [...row]),
+                    queue: [currentTile, nextTile],
+                    conveyor: [...sourceConveyor],
+                    incomingTarget: sourceIncomingTarget,
+                    mode: 'direct',
+                    gameOver: false,
+                    score: stateRef.current.score,
+                    rowsClearedTotal: rowsClearedCount || 0,
+                    advanceCount: stateRef.current.advanceCount,
+                    swapsAvailable: stateRef.current.swapsAvailable,
+                    swapRegenElapsedMs: stateRef.current.swapRegenElapsedMs
+                };
+                return GameDemoApi.chooseDemoColumn(gameState, (baseState, simulated, evalTile, evalNextTile) => (
+                    evaluateSimulatedMove(
+                        baseState.grid,
+                        baseState.conveyor,
+                        baseState.incomingTarget,
+                        simulated ? { nextGrid: simulated.nextState.grid, landingRow: simulated.landingRow, colIndex: simulated.colIndex } : null,
+                        baseState.rowsClearedTotal,
+                        evalTile,
+                        evalNextTile
+                    )
+                ));
             };
 
             const startDirectDrop = (colIndex) => {
@@ -2045,8 +2052,7 @@
             }, [mode, gameOver, guideOpen]);
 
             const getTickDuration = (advances) => {
-                const t = Math.min(advances / TICK_RAMP_ADVANCES, 1);
-                return Math.round(MAX_TICK_MS - (MAX_TICK_MS - MIN_TICK_MS) * t);
+                return GameRules.getTickDuration(advances);
             };
 
             const canInteractWithSwapRow = useCallback((rowIndex, { allowDemo = false } = {}) => {
@@ -2277,8 +2283,21 @@
             // Conveyor movement: once the shift is visible, resolve matches against the now-visible targets.
             const evaluateRowsAndAdvance = () => {
                 const { grid, conveyor, incomingTarget, advanceCount, rowsClearedTotal } = stateRef.current;
-                const { distance: shiftCount } = getConveyorAdvanceDistance(grid, conveyor, incomingTarget);
-                const animDuration = getConveyorAnimationDuration(shiftCount);
+                const modelAdvance = GameRules.advanceConveyorState({
+                    grid,
+                    queue: stateRef.current.queue,
+                    conveyor,
+                    incomingTarget,
+                    mode: stateRef.current.mode,
+                    gameOver: stateRef.current.gameOver,
+                    score: stateRef.current.score,
+                    rowsClearedTotal,
+                    advanceCount,
+                    swapsAvailable: stateRef.current.swapsAvailable,
+                    swapRegenElapsedMs: stateRef.current.swapRegenElapsedMs
+                });
+                const shiftCount = modelAdvance.shiftDistance;
+                const animDuration = modelAdvance.animationDuration;
 
                 cancelArmedSwap();
                 setConveyorAnimShift(shiftCount);
@@ -2286,8 +2305,9 @@
                 setConveyorAnim(true);
 
                 setTimeout(() => {
-                    const { nextConveyor: newConveyor, nextIncoming: newIncomingTarget } = buildConveyorAdvanceResult(conveyor, incomingTarget, shiftCount, rowsClearedTotal);
-                    const nextAdvanceCount = advanceCount + shiftCount;
+                    const newConveyor = modelAdvance.nextState.conveyor;
+                    const newIncomingTarget = modelAdvance.nextState.incomingTarget;
+                    const nextAdvanceCount = modelAdvance.nextState.advanceCount;
 
                     setConveyorAnim(false);
                     setConveyor(newConveyor);
